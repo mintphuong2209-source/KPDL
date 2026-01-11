@@ -17,7 +17,7 @@ st.set_page_config(page_title="Hỏi Đáp Dịch Vụ Công", layout="wide")
 st.title("🤖 Chatbot Tư Vấn Dịch Vụ Công & Cư Trú")
 
 # 👉 TÊN FILE DỮ LIỆU MỚI CỦA BẠN
-JSON_FILE = "dich_vu_cong_chunks.json" 
+JSON_FILE = "all_chunks_normalized.json" 
 COLLECTION_NAME = "dichvucong_db_v1" # Tên kho dữ liệu
 
 # ================= 2. CẤU HÌNH API & MODEL =================
