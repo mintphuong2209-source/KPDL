@@ -17,7 +17,7 @@ from google.api_core import exceptions
 
 # ================= CẤU HÌNH TRANG =================
 st.set_page_config(page_title="Chatbot Pháp Luật", layout="wide")
-st.title("🤖 Chatbot Tư Vấn (Chế độ Fallback Thông Minh)")
+st.title("🤖 Chatbot Tư Vấn")
 
 COLLECTION_NAME = "dichvucong_smart_v1"
 
