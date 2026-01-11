@@ -1,0 +1,10 @@
+requests
+beautifulsoup4
+html2text
+chromadb
+google-generativeai
+streamlit
+torch
+torchvision
+torchaudio
+sentence-transformers
