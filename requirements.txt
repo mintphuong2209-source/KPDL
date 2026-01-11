@@ -2,5 +2,5 @@ streamlit
 chromadb
 google-generativeai
 sentence-transformers
-torch
 pysqlite3-binary
+torch --index-url https://download.pytorch.org/whl/cpu
