@@ -28,79 +28,82 @@ except Exception:
 JSON_FILE = "data/all_procedures_normalized.json"
 COLLECTION_NAME = "dichvucong_rag_collection"
 
-# ================= HÀM LOAD DỮ LIỆU (CACHED) =================
-@st.cache_resource
-def load_vector_db():
-    """
-    Khởi tạo ChromaDB và nạp dữ liệu từ file JSON.
-    Dùng cache để không phải nạp lại mỗi lần reload trang.
-    """
-    # Sử dụng model nhẹ hơn bge-m3 một chút để chạy mượt trên Cloud Free
-    # Hoặc bạn có thể giữ nguyên "BAAI/bge-m3" nếu muốn
-    EMBEDDING_MODEL = "keepitreal/vietnamese-sbert" 
+# ... (Phần import giữ nguyên như cũ, nhớ 3 dòng fix sqlite ở đầu) ...
+
+# ================= 3. HÀM LOAD DỮ LIỆU (CÓ BÁO LỖI CHI TIẾT) =================
+@st.cache_resource(ttl="2h") 
+def load_all_json_files():
+    EMBEDDING_MODEL = "keepitreal/vietnamese-sbert"
     
-    embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=EMBEDDING_MODEL
-    )
-
-    # Sử dụng EphemeralClient (chạy trên RAM) cho môi trường Cloud
-    chroma_client = chromadb.Client()
-    
-    # Tạo hoặc lấy collection
-    collection = chroma_client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=embedding_function
-    )
-
-    # Kiểm tra nếu collection rỗng thì mới nạp
-    if collection.count() == 0:
-        if not os.path.exists(JSON_FILE):
-            st.error(f"Không tìm thấy file dữ liệu tại {JSON_FILE}")
-            return None
-
-        with open(JSON_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        ids = []
-        documents = []
-        metadatas = []
-
-        # Chuẩn bị dữ liệu (Batch processing để tránh quá tải RAM)
-        batch_size = 100
-        total_chunks = len(data)
+    try:
+        # 1. Khởi tạo ChromaDB
+        embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=EMBEDDING_MODEL
+        )
+        chroma_client = chromadb.Client()
+        collection = chroma_client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            embedding_function=embedding_function
+        )
         
-        progress_text = "Đang nạp dữ liệu vào bộ nhớ..."
-        my_bar = st.progress(0, text=progress_text)
+        # 2. Tìm file JSON
+        json_files = glob.glob("*.json")
+        if not json_files:
+            return "NO_FILES_FOUND" # Mã lỗi riêng
 
-        for idx, item in enumerate(data):
-            ids.append(str(item.get("id", idx))) # Đảm bảo ID là string
-            documents.append(item["content_text"])
+        # 3. Đọc dữ liệu
+        if collection.count() == 0:
+            ids, documents, metadatas = [], [], []
             
-            # Xử lý metadata (Chroma không nhận None value, phải chuyển thành string rỗng)
-            meta = item.get("metadata", {}).copy()
-            meta.update({
-                "url": item.get("url", ""),
-                "title": item.get("title", ""),
-                "hierarchy": item.get("hierarchy", ""),
-                "chunk_type": item.get("chunk_type", ""),
-            })
-            # Clean metadata values
-            clean_meta = {k: str(v) if v is not None else "" for k, v in meta.items()}
-            metadatas.append(clean_meta)
+            for file_name in json_files:
+                with open(file_name, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    for item in data:
+                        # Lọc dữ liệu rỗng
+                        if not item.get("content_text"): continue
+                        
+                        ids.append(str(uuid.uuid4()))
+                        documents.append(item.get("content_text"))
+                        
+                        # Xử lý metadata
+                        meta = item.get("metadata", {}).copy()
+                        meta["source_file"] = file_name
+                        # Xóa giá trị None để tránh lỗi
+                        clean_meta = {k: str(v) for k, v in meta.items() if v is not None}
+                        metadatas.append(clean_meta)
+            
+            if not documents:
+                return "EMPTY_DATA"
 
-        # Add to Chroma theo batch
-        for i in range(0, len(ids), batch_size):
-            end_idx = min(i + batch_size, len(ids))
-            collection.add(
-                ids=ids[i:end_idx],
-                documents=documents[i:end_idx],
-                metadatas=metadatas[i:end_idx]
-            )
-            my_bar.progress(min(i / total_chunks, 1.0), text=f"Đã nạp {i}/{total_chunks} chunks")
+            # 4. Nạp Batch
+            batch_size = 40
+            for i in range(0, len(ids), batch_size):
+                collection.add(
+                    ids=ids[i:i+batch_size],
+                    documents=documents[i:i+batch_size],
+                    metadatas=metadatas[i:i+batch_size]
+                )
+                
+        return collection
         
-        my_bar.empty()
-        
-    return collection
+    except Exception as e:
+        # TRẢ VỀ CHI TIẾT LỖI ĐỂ DEBUG
+        return f"ERROR_DETAIL: {str(e)}"
+
+# --- GỌI HÀM (SỬA LẠI ĐỂ BẮT LỖI) ---
+with st.spinner("Đang khởi động hệ thống..."):
+    collection = load_all_json_files()
+
+if isinstance(collection, str): # Nếu trả về chuỗi nghĩa là có lỗi
+    if "ERROR_DETAIL" in collection:
+        st.error(f"❌ LỖI HỆ THỐNG CHI TIẾT: {collection}")
+        st.info("👉 Hãy chụp ảnh lỗi này gửi cho tôi để được hỗ trợ!")
+    elif collection == "NO_FILES_FOUND":
+        st.warning("⚠️ Không tìm thấy file .json nào trên GitHub. Bạn đã upload file chưa?")
+    st.stop()
+
+# Nếu thành công
+st.sidebar.success(f"✅ Đã nạp: **{collection.count()}** chunks")
 
 # ================= HÀM TRUY VẤN (RAG) =================
 def query_gemini(question, collection, model_name="gemini-2.5-flash"):
