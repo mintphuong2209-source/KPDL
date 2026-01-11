@@ -130,7 +130,7 @@ def query_rag(query_text, top_k=3):
         YÊU CẦU: Trả lời ngắn gọn, chính xác bằng tiếng Việt.
         """
         
-        model = genai.GenerativeModel('gemini-1.5-flash-001')
+        model = genai.GenerativeModel('gemini-pro')
         response = model.generate_content(prompt)
         return response.text, sources
     except Exception as e:
