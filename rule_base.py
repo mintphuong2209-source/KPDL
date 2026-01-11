@@ -1,233 +1,166 @@
+# ================= 1. FIX LỖI DATABASE (BẮT BUỘC ĐỂ DÒNG ĐẦU TIÊN) =================
 __import__('pysqlite3')
 import sys
 sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-# =============================================================================
+# ===================================================================================
 
 import streamlit as st
 import json
 import os
-import glob # Thư viện để tìm tất cả file
+import glob
 import uuid
 import chromadb
 from chromadb.utils import embedding_functions
 import google.generativeai as genai
 
-# ================= CẤU HÌNH TRANG =================
-st.set_page_config(page_title="Chatbot Tổng Hợp Cư Trú", layout="wide")
+# --- CẤU HÌNH TRANG ---
+st.set_page_config(page_title="Chatbot Pháp Luật", layout="wide")
 st.title("🤖 Chatbot Tư Vấn Pháp Luật & Cư Trú")
 
-COLLECTION_NAME = "all_files_db_v1" # Tên kho dữ liệu chung
+COLLECTION_NAME = "dichvucong_db_final_v5" # Đổi tên mới để xóa cache cũ
 
-# ================= 2. CẤU HÌNH API & MODEL =================
+# --- CẤU HÌNH API ---
 st.sidebar.header("⚙️ Cấu hình")
-
-api_key = st.secrets.get("GEMINI_API_KEY") 
+api_key = st.secrets.get("GEMINI_API_KEY")
 if not api_key:
-    api_key = st.sidebar.text_input("Nhập Google AI Studio API Key:", type="password")
+    api_key = st.sidebar.text_input("Nhập Google AI API Key:", type="password")
     if not api_key:
-        st.warning("👉 Vui lòng nhập API Key để bắt đầu.")
+        st.warning("👉 Vui lòng nhập API Key.")
         st.stop()
 
 genai.configure(api_key=api_key)
 
-# Tự động chọn model (Ưu tiên Flash)
+# Chọn Model
 try:
     models = [m.name for m in genai.list_models() if 'gemini' in m.name and 'generateContent' in m.supported_generation_methods]
-    default_idx = 0
-    for i, m in enumerate(models):
-        if "flash" in m: default_idx = i; break
-    
-    SELECTED_MODEL = st.sidebar.selectbox("Chọn Model AI:", models, index=default_idx)
-except Exception as e:
-    st.sidebar.error(f"Lỗi kết nối API: {e}")
+    model_choice = st.sidebar.selectbox("Chọn Model:", models, index=0)
+except:
+    st.sidebar.error("Lỗi kết nối Google AI.")
     st.stop()
 
-# ================= 3. HÀM LOAD TOÀN BỘ FILE JSON =================
-@st.cache_resource(ttl="2h") 
-def load_all_json_files():
-    """
-    Hàm này quét toàn bộ file .json trong thư mục và nạp vào ChromaDB.
-    Tuyệt đối KHÔNG vẽ UI trong hàm này để tránh lỗi Cache.
-    """
-    EMBEDDING_MODEL = "keepitreal/vietnamese-sbert"
-    
+# ================= 3. HÀM NẠP DỮ LIỆU (SIÊU BỀN) =================
+@st.cache_resource(ttl="2h")
+def load_data_to_vector_db():
     try:
-        # 1. Khởi tạo ChromaDB
+        # 1. Setup ChromaDB
         embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=EMBEDDING_MODEL
+            model_name="keepitreal/vietnamese-sbert"
         )
-        chroma_client = chromadb.Client()
-        collection = chroma_client.get_or_create_collection(
+        client = chromadb.Client()
+        collection = client.get_or_create_collection(
             name=COLLECTION_NAME,
             embedding_function=embedding_function
         )
+
+        # 2. Nếu DB đã có dữ liệu thì dùng luôn, không nạp lại
+        if collection.count() > 0:
+            return collection, f"Đã có sẵn {collection.count()} chunks."
+
+        # 3. Tìm file JSON trong thư mục
+        json_files = glob.glob("*.json")
+        if not json_files:
+            return None, "KHONG_TIM_THAY_FILE_JSON"
+
+        # 4. Đọc file
+        all_docs = []
+        all_ids = []
+        all_metas = []
         
-        # 2. Chỉ nạp nếu DB rỗng
-        if collection.count() == 0:
-            # --- TỰ ĐỘNG TÌM FILE ---
-            json_files = glob.glob("*.json") # Lấy tất cả file có đuôi .json
-            
-            if not json_files:
-                return "NO_FILES"
-
-            all_data = []
-            seen_content = set() # Dùng để lọc trùng lặp giữa các file
-            
-            # Đọc từng file và gộp lại
-            for file_name in json_files:
-                try:
-                    with open(file_name, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        if isinstance(data, list):
-                            for item in data:
-                                content = item.get("content_text", "").strip()
-                                # Chỉ lấy nếu nội dung chưa từng xuất hiện và đủ dài
-                                if content and content not in seen_content and len(content) > 10:
-                                    seen_content.add(content)
-                                    # Đánh dấu nguồn gốc file để dễ debug
-                                    item["metadata"]["source_file"] = file_name 
-                                    all_data.append(item)
-                except:
-                    pass # Bỏ qua file lỗi
-
-            if not all_data:
-                return "EMPTY_DATA"
-
-            # 3. Chuẩn bị dữ liệu nạp
-            ids = []
-            documents = []
-            metadatas = []
-            
-            for item in all_data:
-                # Tạo ID
-                if "id" in item:
-                    ids.append(str(item["id"]))
-                else:
-                    ids.append(str(uuid.uuid4()))
-                
-                documents.append(item.get("content_text", ""))
-                
-                # Xử lý metadata
-                meta = item.get("metadata", {}).copy()
-                meta.update({
-                    "url": item.get("url", ""),
-                    "title": item.get("title", ""),
-                    "hierarchy": item.get("hierarchy", ""),
-                    "source_file": item.get("metadata", {}).get("source_file", "")
-                })
-                # Làm sạch metadata (xóa None)
-                clean_meta = {k: (str(v) if v is not None else "") for k, v in meta.items()}
-                metadatas.append(clean_meta)
-            
-            # 4. Nạp Batch (40 items/lần)
-            batch_size = 40
-            for i in range(0, len(ids), batch_size):
-                collection.add(
-                    ids=ids[i:i+batch_size],
-                    documents=documents[i:i+batch_size],
-                    metadatas=metadatas[i:i+batch_size]
-                )
-                
-        return collection
+        file_list_str = ""
         
+        for file_path in json_files:
+            file_list_str += f"{file_path}, "
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    for item in data:
+                        content = item.get("content_text", "").strip()
+                        if len(content) < 10: continue
+                        
+                        all_ids.append(str(uuid.uuid4()))
+                        all_docs.append(content)
+                        
+                        # Xử lý metadata an toàn
+                        meta = item.get("metadata", {}).copy()
+                        meta["source_file"] = file_path
+                        meta["url"] = item.get("url", "")
+                        # Chroma không chịu value là None
+                        clean_meta = {k: str(v) for k, v in meta.items() if v is not None}
+                        all_metas.append(clean_meta)
+
+        if not all_docs:
+            return None, "FILE_RONG"
+
+        # 5. Nạp Batch (Để không bị tràn RAM)
+        batch_size = 40
+        for i in range(0, len(all_ids), batch_size):
+            collection.add(
+                ids=all_ids[i : i+batch_size],
+                documents=all_docs[i : i+batch_size],
+                metadatas=all_metas[i : i+batch_size]
+            )
+            
+        return collection, f"Thành công! Đã nạp {len(all_ids)} chunks từ: {file_list_str}"
+
     except Exception as e:
-        print(f"Lỗi nạp DB: {e}")
-        return None
+        return None, f"LOI_HE_THONG: {str(e)}"
 
-# --- GỌI HÀM NẠP VÀ HIỂN THỊ (BÊN NGOÀI CACHE) ---
-with st.spinner("Đang quét và tổng hợp dữ liệu từ tất cả các file..."):
-    collection = load_all_json_files()
+# --- GỌI HÀM VÀ HIỂN THỊ KẾT QUẢ ---
+with st.spinner("Đang khởi động hệ thống tri thức..."):
+    collection, status_msg = load_data_to_vector_db()
 
-# Xử lý các trạng thái
-if collection == "NO_FILES":
-    st.error("❌ Không tìm thấy file .json nào trên GitHub.")
-    st.stop()
-elif collection == "EMPTY_DATA":
-    st.error("❌ Các file JSON đều rỗng hoặc lỗi định dạng.")
-    st.stop()
-elif collection is None:
-    st.error("❌ Lỗi hệ thống khi khởi tạo ChromaDB.")
+# Xử lý hiển thị lỗi/thành công
+if collection is None:
+    if "KHONG_TIM_THAY" in status_msg:
+        st.error("⚠️ Không tìm thấy file `.json` nào trên GitHub. Bạn đã upload file cào được chưa?")
+    elif "LOI_HE_THONG" in status_msg:
+        st.error(f"❌ {status_msg}")
+        st.info("Hãy kiểm tra lại file requirements.txt xem có dòng 'pysqlite3-binary' chưa.")
+    else:
+        st.error(f"❌ Lỗi dữ liệu: {status_msg}")
     st.stop()
 else:
-    # Hiển thị thành công
-    count = collection.count()
-    st.sidebar.success(f"📚 Tổng dữ liệu: **{count}** chunks")
-    
-    # Liệt kê các file tìm thấy (để bạn kiểm tra)
-    with st.sidebar.expander("📂 Các file đã đọc"):
-        found_files = glob.glob("*.json")
-        for f in found_files:
-            st.write(f"- `{f}`")
+    st.sidebar.success(f"✅ {status_msg}")
 
-# ================= 4. LOGIC RAG =================
-def query_rag(query_text, model_name, top_k=12): # Lấy 12 chunk để đủ thông tin
+# ================= 4. LOGIC CHATBOT =================
+def query_ai(question):
     try:
-        results = collection.query(
-            query_texts=[query_text],
-            n_results=top_k,
-            include=["documents", "metadatas"]
-        )
+        results = collection.query(query_texts=[question], n_results=10)
         
-        context_parts = []
+        context = ""
         sources = []
+        if results['documents']:
+            for i, doc in enumerate(results['documents'][0]):
+                meta = results['metadatas'][0][i]
+                source_url = meta.get('url', '#')
+                file_name = meta.get('source_file', '')
+                context += f"- Nội dung: {doc}\n- Nguồn: {file_name}\n---\n"
+                sources.append(source_url)
         
-        if results["documents"]:
-            for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-                h = meta.get('hierarchy', 'Thông tin')
-                src_file = meta.get('source_file', 'unknown')
-                
-                context_parts.append(f"--- (File: {src_file}) | {h} ---\n{doc}")
-                sources.append(f"- [{h}] (Nguồn: {src_file})")
-                
-        context = "\n\n".join(context_parts)
+        prompt = f"""Bạn là trợ lý ảo pháp luật. Dựa vào thông tin sau:\n{context}\n\nHãy trả lời câu hỏi: {question}"""
         
-        prompt = f"""
-        Bạn là trợ lý ảo hỗ trợ pháp lý. 
-        Dựa vào các văn bản pháp luật được cung cấp dưới đây, hãy trả lời câu hỏi.
-        
-        YÊU CẦU:
-        1. Trả lời chi tiết, có căn cứ.
-        2. Nếu thông tin đến từ nhiều nguồn (nhiều file), hãy tổng hợp lại.
-        3. Văn phong rõ ràng, dễ hiểu.
-        
-        NGỮ CẢNH DỮ LIỆU:
-        {context}
-        
-        CÂU HỎI: {query_text}
-        """
-        
-        model = genai.GenerativeModel(model_name)
+        model = genai.GenerativeModel(model_choice)
         response = model.generate_content(prompt)
-        return response.text, list(set(sources)), context
-        
+        return response.text, list(set(sources))
     except Exception as e:
-        return f"Lỗi: {str(e)}", [], ""
+        return f"Lỗi khi gọi AI: {str(e)}", []
 
-# ================= 5. GIAO DIỆN CHAT =================
+# Giao diện Chat
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "Xin chào! Tôi đã đọc hết các file dữ liệu của bạn. Bạn cần hỏi gì?"}]
+    st.session_state.messages = [{"role": "assistant", "content": "Xin chào! Bạn cần tìm hiểu thủ tục gì?"}]
 
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    st.chat_message(msg["role"]).write(msg["content"])
 
-if prompt := st.chat_input("Nhập câu hỏi..."):
+if prompt := st.chat_input():
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
+    st.chat_message("user").write(prompt)
+    
     with st.chat_message("assistant"):
-        with st.spinner("Đang tổng hợp thông tin..."):
-            answer, sources, debug_ctx = query_rag(prompt, SELECTED_MODEL)
-            
-            if sources:
-                full_resp = f"{answer}\n\n**📚 Nguồn tham khảo:**\n" + "\n".join(sources)
-            else:
-                full_resp = answer
-            
-            st.markdown(full_resp)
-            
-            with st.expander("🕵️ Xem dữ liệu tìm được"):
-                st.text(debug_ctx)
-            
-            st.session_state.messages.append({"role": "assistant", "content": full_resp})
+        with st.spinner("Đang tra cứu..."):
+            ans, srcs = query_ai(prompt)
+            st.write(ans)
+            if srcs:
+                st.write("**Nguồn tham khảo:**")
+                for s in srcs: st.write(f"- {s}")
+            st.session_state.messages.append({"role": "assistant", "content": ans})
