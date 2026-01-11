@@ -38,7 +38,7 @@ except:
     st.sidebar.error("Lỗi kết nối Google AI.")
     st.stop()
 
-# ================= 3. HÀM NẠP DỮ LIỆU (SIÊU BỀN) =================
+# ================= 3. HÀM NẠP DỮ LIỆU  =================
 @st.cache_resource(ttl="2h")
 def load_data_to_vector_db():
     try:
