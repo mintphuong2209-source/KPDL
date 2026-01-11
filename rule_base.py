@@ -13,12 +13,12 @@ from chromadb.utils import embedding_functions
 import google.generativeai as genai
 
 # ================= CẤU HÌNH TRANG =================
-st.set_page_config(page_title="Chatbot Hỗ Trợ Cư Trú", layout="wide")
-st.title("🤖 Chatbot Tư Vấn Thủ Tục Cư Trú")
+st.set_page_config(page_title="Hỏi Đáp Dịch Vụ Công", layout="wide")
+st.title("🤖 Chatbot Tư Vấn Dịch Vụ Công & Cư Trú")
 
-# Tên file dữ liệu chuẩn của bạn
-JSON_FILE = "all_chunks_normalized.json" 
-COLLECTION_NAME = "dichvucong_rag_final"
+# 👉 TÊN FILE DỮ LIỆU MỚI CỦA BẠN
+JSON_FILE = "dich_vu_cong_chunks.json" 
+COLLECTION_NAME = "dichvucong_db_v1" # Tên kho dữ liệu
 
 # ================= 2. CẤU HÌNH API & MODEL =================
 st.sidebar.header("⚙️ Cấu hình")
@@ -32,33 +32,29 @@ if not api_key:
 
 genai.configure(api_key=api_key)
 
-# Tự động tìm model (Ưu tiên Flash)
+# Tự động chọn model tốt nhất (Ưu tiên Flash)
 try:
-    available_models = [m.name for m in genai.list_models() if 'gemini' in m.name and 'generateContent' in m.supported_generation_methods]
+    models = [m.name for m in genai.list_models() if 'gemini' in m.name and 'generateContent' in m.supported_generation_methods]
     default_idx = 0
-    for i, m in enumerate(available_models):
+    for i, m in enumerate(models):
         if "flash" in m: default_idx = i; break
     
-    if available_models:
-        SELECTED_MODEL = st.sidebar.selectbox("Chọn Model AI:", available_models, index=default_idx)
-    else:
-        st.sidebar.error("❌ Không tìm thấy model Gemini nào.")
-        st.stop()
+    SELECTED_MODEL = st.sidebar.selectbox("Chọn Model AI:", models, index=default_idx)
 except Exception as e:
-    st.sidebar.error(f"Lỗi API: {e}")
+    st.sidebar.error(f"Lỗi kết nối API: {e}")
     st.stop()
 
-# ================= 3. HÀM LOAD DỮ LIỆU (KHÔNG CÓ UI BÊN TRONG) =================
+# ================= 3. HÀM LOAD DỮ LIỆU (CORE LOGIC) =================
 @st.cache_resource(ttl="2h") 
 def get_vector_collection():
     """
-    Hàm này chỉ thực hiện logic nạp dữ liệu, tuyệt đối KHÔNG vẽ UI (st.write, st.progress...)
+    Hàm này chỉ nạp dữ liệu, KHÔNG được chứa lệnh vẽ giao diện (st.write, st.spinner...)
     để tránh lỗi CacheReplayClosureError.
     """
     EMBEDDING_MODEL = "keepitreal/vietnamese-sbert"
     
     try:
-        # 1. Khởi tạo Client
+        # 1. Khởi tạo ChromaDB
         embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
             model_name=EMBEDDING_MODEL
         )
@@ -68,34 +64,46 @@ def get_vector_collection():
             embedding_function=embedding_function
         )
         
-        # 2. Kiểm tra dữ liệu
+        # 2. Kiểm tra nếu DB rỗng thì nạp từ file JSON
         if collection.count() == 0:
             if not os.path.exists(JSON_FILE):
-                return None # Trả về None để xử lý lỗi ở ngoài
+                return None # Báo lỗi file không tồn tại
             
             with open(JSON_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
             if not data or not isinstance(data, list):
-                return None
+                return "EMPTY_DATA" # Báo lỗi file rỗng
 
-            # 3. Chuẩn bị Batch
-            ids = [str(uuid.uuid4()) if "id" not in item else str(item["id"]) for item in data]
-            documents = [item.get("content_text", "") for item in data]
+            # 3. Chuẩn bị dữ liệu
+            ids = []
+            documents = []
             metadatas = []
             
             for item in data:
+                # Lấy nội dung text
+                content = item.get("content_text", "")
+                if not content: continue
+                
+                # Tạo ID duy nhất
+                if "id" in item:
+                    ids.append(str(item["id"]))
+                else:
+                    ids.append(str(uuid.uuid4()))
+                
+                documents.append(content)
+                
+                # Xử lý metadata (Chroma không nhận None)
                 meta = item.get("metadata", {}).copy()
                 meta.update({
                     "url": item.get("url", ""),
                     "title": item.get("title", ""),
                     "hierarchy": item.get("hierarchy", ""),
                 })
-                # Xóa giá trị None để tránh lỗi Chroma
                 clean_meta = {k: (str(v) if v is not None else "") for k, v in meta.items()}
                 metadatas.append(clean_meta)
             
-            # 4. Nạp dữ liệu (Không dùng progress bar ở đây)
+            # 4. Nạp theo lô (Batch) để tiết kiệm RAM
             batch_size = 40
             for i in range(0, len(ids), batch_size):
                 collection.add(
@@ -108,22 +116,31 @@ def get_vector_collection():
         
     except Exception as e:
         print(f"Lỗi nạp DB: {e}")
-        return None
+        return "ERROR"
 
-# --- GỌI HÀM NẠP DỮ LIỆU ---
-# Đặt st.spinner ở ngoài hàm cache
-with st.spinner("Đang khởi tạo bộ nhớ tri thức (Lần đầu sẽ mất khoảng 1-2 phút)..."):
+# --- GỌI HÀM NẠP VÀ HIỂN THỊ TRẠNG THÁI ---
+with st.status("Đang khởi động hệ thống tri thức...", expanded=True) as status:
+    st.write("🔄 Đang kết nối cơ sở dữ liệu...")
     collection = get_vector_collection()
+    
+    if collection is None:
+        status.update(label="Lỗi khởi động!", state="error")
+        st.error(f"❌ Không tìm thấy file `{JSON_FILE}`. Hãy upload file này lên GitHub.")
+        st.stop()
+    elif collection == "EMPTY_DATA":
+        status.update(label="Lỗi dữ liệu!", state="error")
+        st.error("❌ File JSON bị rỗng hoặc sai định dạng.")
+        st.stop()
+    elif collection == "ERROR":
+        status.update(label="Lỗi hệ thống!", state="error")
+        st.error("❌ Lỗi khi khởi tạo ChromaDB.")
+        st.stop()
+    else:
+        count = collection.count()
+        status.update(label="Sẵn sàng!", state="complete", expanded=False)
+        st.sidebar.success(f"📦 Dữ liệu đã nạp: **{count}** chunks")
 
-# Xử lý trường hợp lỗi
-if collection is None:
-    st.error(f"❌ Không thể nạp dữ liệu. Vui lòng kiểm tra file `{JSON_FILE}` trên GitHub.")
-    st.stop()
-
-# Hiển thị thống kê
-st.sidebar.success(f"📦 Dữ liệu đã nạp: **{collection.count()}** chunks")
-
-# ================= 4. LOGIC RAG =================
+# ================= 4. LOGIC TÌM KIẾM & TRẢ LỜI =================
 def query_rag(query_text, model_name, top_k=10):
     try:
         results = collection.query(
@@ -139,25 +156,27 @@ def query_rag(query_text, model_name, top_k=10):
             for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
                 h = meta.get('hierarchy', 'Thông tin')
                 u = meta.get('url', '#')
-                context_parts.append(f"--- MỤC: {h} ---\n{doc}")
+                source_name = meta.get('source', 'Nguồn')
+                
+                # Tạo ngữ cảnh cho AI đọc
+                context_parts.append(f"--- NGUỒN: {source_name} | MỤC: {h} ---\n{doc}")
                 sources.append(f"- [{h}]({u})")
                 
         context = "\n\n".join(context_parts)
         
         prompt = f"""
-        Bạn là trợ lý ảo hành chính công chuyên về Luật Cư trú.
-        Hãy trả lời câu hỏi của công dân dựa trên thông tin được cung cấp dưới đây.
+        Bạn là trợ lý ảo hành chính công chuyên nghiệp.
+        Nhiệm vụ: Trả lời câu hỏi dựa trên thông tin được cung cấp dưới đây.
         
-        NGUYÊN TẮC:
-        1. Trả lời chính xác, ngắn gọn, dễ hiểu.
-        2. Nếu là quy trình, hãy liệt kê các bước (Bước 1, Bước 2...).
-        3. Nếu hồ sơ yêu cầu giấy tờ, hãy liệt kê bằng gạch đầu dòng.
-        4. Tuyệt đối không bịa đặt thông tin nếu không có trong ngữ cảnh.
+        YÊU CẦU:
+        1. Trả lời chi tiết, chính xác, không bịa đặt.
+        2. Nếu là quy trình, hãy trình bày từng bước (Bước 1, Bước 2...).
+        3. Văn phong lịch sự, dễ hiểu.
         
-        NGỮ CẢNH THÔNG TIN:
+        DỮ LIỆU THAM KHẢO:
         {context}
         
-        CÂU HỎI: {query_text}
+        CÂU HỎI CỦA CÔNG DÂN: {query_text}
         """
         
         model = genai.GenerativeModel(model_name)
@@ -169,7 +188,7 @@ def query_rag(query_text, model_name, top_k=10):
 
 # ================= 5. GIAO DIỆN CHAT =================
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "Xin chào! Mình là trợ lý ảo hỗ trợ thủ tục cư trú (Thường trú, Tạm trú, Tách hộ...). Bạn cần giúp gì không?"}]
+    st.session_state.messages = [{"role": "assistant", "content": "Xin chào! Tôi có thể giúp gì về thủ tục hành chính (Thường trú, Tạm trú, CCCD...)?"}]
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -181,7 +200,7 @@ if prompt := st.chat_input("Nhập câu hỏi của bạn..."):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Đang tra cứu luật..."):
+        with st.spinner("Đang tra cứu quy định pháp luật..."):
             answer, sources, debug_ctx = query_rag(prompt, SELECTED_MODEL)
             
             if sources:
@@ -191,7 +210,8 @@ if prompt := st.chat_input("Nhập câu hỏi của bạn..."):
             
             st.markdown(full_resp)
             
-            with st.expander("🕵️ Xem dữ liệu hệ thống tìm được"):
+            # Debug: Xem AI đã đọc được gì (giúp bạn kiểm tra dữ liệu)
+            with st.expander("🕵️ Dữ liệu trích xuất"):
                 st.text(debug_ctx)
             
             st.session_state.messages.append({"role": "assistant", "content": full_resp})
